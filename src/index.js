@@ -1,160 +1,164 @@
 require('dotenv').config();
-const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Events,
-  EmbedBuilder,
-  PermissionFlagsBits
-} = require('discord.js');
-const { initDb, saveJoin, markLeft, getInviteStats, getLeaderboard, resetUserInvites, pool } = require('./db');
+const { Client, GatewayIntentBits, Events, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
+const { Pool } = require('pg');
 
-const token = process.env.DISCORD_TOKEN;
-if (!token) throw new Error('DISCORD_TOKEN is missing. Add it to Railway Variables.');
+const { DISCORD_TOKEN, DATABASE_URL, PGSSL } = process.env;
+if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN environment variable.');
+if (!DATABASE_URL) throw new Error('Missing DATABASE_URL. Add a Railway PostgreSQL database and its DATABASE_URL variable.');
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites],
-  partials: [Partials.GuildMember]
-});
-
-// Cache invite use counts so we can identify which invite was used on a join.
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: PGSSL === 'false' ? false : { rejectUnauthorized: false } });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildInvites] });
 const inviteCache = new Map();
-const cacheKey = guildId => guildId;
 
-async function refreshGuildInvites(guild) {
+async function initDb() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id TEXT PRIMARY KEY, welcome_channel_id TEXT, invite_logs_channel_id TEXT
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS invite_counts (
+    guild_id TEXT NOT NULL, user_id TEXT NOT NULL, count BIGINT NOT NULL DEFAULT 0 CHECK (count >= 0),
+    PRIMARY KEY (guild_id, user_id)
+  )`);
+}
+async function getSettings(guildId) {
+  const r = await pool.query('SELECT * FROM guild_settings WHERE guild_id=$1', [guildId]);
+  return r.rows[0] || null;
+}
+async function getCount(guildId, userId) {
+  const r = await pool.query('SELECT count FROM invite_counts WHERE guild_id=$1 AND user_id=$2', [guildId, userId]);
+  return Number(r.rows[0]?.count || 0);
+}
+async function setCount(guildId, userId, count) {
+  await pool.query(`INSERT INTO invite_counts (guild_id,user_id,count) VALUES ($1,$2,$3)
+    ON CONFLICT (guild_id,user_id) DO UPDATE SET count=EXCLUDED.count`, [guildId, userId, count]);
+}
+async function addCount(guildId, userId, amount) {
+  await pool.query(`INSERT INTO invite_counts (guild_id,user_id,count) VALUES ($1,$2,$3)
+    ON CONFLICT (guild_id,user_id) DO UPDATE SET count=invite_counts.count + EXCLUDED.count`, [guildId, userId, amount]);
+}
+async function sendToChannel(guild, channelId, payload) {
+  if (!channelId) return false;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased() || !channel.send) return false;
+  const me = guild.members.me;
+  if (me && !channel.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) return false;
+  await channel.send(payload).catch(err => console.error(`Could not send message to channel ${channelId}:`, err.message));
+  return true;
+}
+async function cacheGuildInvites(guild) {
   try {
     const invites = await guild.invites.fetch();
-    inviteCache.set(cacheKey(guild.id), new Map(invites.map(invite => [invite.code, invite.uses ?? 0])));
-  } catch (error) {
-    console.warn(`[invites] Cannot fetch invites for ${guild.name}. Give the bot Manage Server permission.`, error.message);
+    inviteCache.set(guild.id, new Map(invites.map(inv => [inv.code, inv.uses ?? 0])));
+  } catch (e) {
+    console.warn(`Could not fetch invites in ${guild.name}. Ensure the bot has Manage Guild permission.`, e.message);
   }
 }
 
 client.once(Events.ClientReady, async readyClient => {
-  console.log(`[ready] ${process.env.BOT_NAME || 'Invite Tracker'} logged in as ${readyClient.user.tag}`);
+  console.log(`Logged in as ${readyClient.user.tag}`);
   await initDb();
-  for (const guild of readyClient.guilds.cache.values()) await refreshGuildInvites(guild);
-  console.log(`[ready] Tracking invites in ${readyClient.guilds.cache.size} server(s).`);
+  for (const guild of readyClient.guilds.cache.values()) await cacheGuildInvites(guild);
 });
-
-client.on(Events.GuildCreate, async guild => {
-  await refreshGuildInvites(guild);
+client.on(Events.GuildCreate, guild => cacheGuildInvites(guild));
+client.on(Events.InviteCreate, invite => {
+  const current = inviteCache.get(invite.guild.id) || new Map();
+  current.set(invite.code, invite.uses ?? 0);
+  inviteCache.set(invite.guild.id, current);
 });
-
-client.on(Events.InviteCreate, async invite => {
-  if (!invite.guild) return;
-  const key = cacheKey(invite.guild.id);
-  if (!inviteCache.has(key)) inviteCache.set(key, new Map());
-  inviteCache.get(key).set(invite.code, invite.uses ?? 0);
-});
-
 client.on(Events.InviteDelete, invite => {
-  if (!invite.guild) return;
-  inviteCache.get(cacheKey(invite.guild.id))?.delete(invite.code);
+  const current = inviteCache.get(invite.guild.id);
+  if (current) current.delete(invite.code);
 });
 
 client.on(Events.GuildMemberAdd, async member => {
   try {
-    const guild = member.guild;
-    const oldUses = inviteCache.get(cacheKey(guild.id)) || new Map();
-    const freshInvites = await guild.invites.fetch();
+    const settings = await getSettings(member.guild.id);
+    const oldInvites = inviteCache.get(member.guild.id) || new Map();
     let usedInvite = null;
-
-    for (const invite of freshInvites.values()) {
-      const previousUses = oldUses.get(invite.code) ?? 0;
-      if ((invite.uses ?? 0) > previousUses) {
-        usedInvite = invite;
-        break;
+    try {
+      const freshInvites = await member.guild.invites.fetch();
+      for (const invite of freshInvites.values()) {
+        const oldUses = oldInvites.get(invite.code) ?? 0;
+        if ((invite.uses ?? 0) > oldUses) { usedInvite = invite; break; }
       }
+      inviteCache.set(member.guild.id, new Map(freshInvites.map(inv => [inv.code, inv.uses ?? 0])));
+    } catch (e) { console.warn('Invite attribution unavailable:', e.message); }
+
+    if (usedInvite?.inviter && !usedInvite.inviter.bot) await addCount(member.guild.id, usedInvite.inviter.id, 1);
+    const welcomeText = `Welcome ${member} to **${member.guild.name}**! You are member **#${member.guild.memberCount}**. 🎉`;
+    if (settings?.welcome_channel_id) await sendToChannel(member.guild, settings.welcome_channel_id, { content: welcomeText });
+    if (settings?.invite_logs_channel_id) {
+      const who = usedInvite?.inviter ? `${usedInvite.inviter.tag} (${usedInvite.inviter.id})` : 'Unknown (vanity, expired, or invite cache unavailable)';
+      await sendToChannel(member.guild, settings.invite_logs_channel_id, { embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Member Joined').setDescription(`${member.user.tag} joined the server.\nInvited by: ${who}\nInvite code: ${usedInvite?.code || 'Unknown'}`).setTimestamp()] });
     }
-
-    inviteCache.set(cacheKey(guild.id), new Map(freshInvites.map(invite => [invite.code, invite.uses ?? 0])));
-
-    let inviterId = usedInvite?.inviter?.id || null;
-    let source = usedInvite ? 'invite' : 'unknown';
-    let inviteCode = usedInvite?.code || null;
-
-    // Vanity URL use counts are not available through the normal invite collection.
-    if (!usedInvite && guild.features.includes('VANITY_URL')) {
-      try {
-        const vanity = await guild.fetchVanityData();
-        if (vanity?.code) {
-          inviteCode = vanity.code;
-          source = 'vanity';
-        }
-      } catch { /* Vanity tracking is optional. */ }
-    }
-
-    await saveJoin({ guildId: guild.id, memberId: member.id, inviterId, inviteCode, source });
-
-    const who = inviterId ? `<@${inviterId}>` : source === 'vanity' ? 'the server vanity URL' : 'an unknown invite';
-    console.log(`[join] ${member.user.tag} joined ${guild.name} via ${who}`);
-  } catch (error) {
-    console.error('[join] Failed to process member join:', error);
-  }
-});
-
-client.on(Events.GuildMemberRemove, async member => {
-  try {
-    await markLeft(member.guild.id, member.id);
-  } catch (error) {
-    console.error('[leave] Failed to update member record:', error);
-  }
+  } catch (e) { console.error('Join tracking error:', e); }
 });
 
 client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.isChatInputCommand() || !interaction.guildId) return;
-
+  if (!interaction.isChatInputCommand()) return;
   try {
-    if (interaction.commandName === 'invites') {
-      const target = interaction.options.getUser('user') || interaction.user;
-      const stats = await getInviteStats(interaction.guildId, target.id);
-      const embed = new EmbedBuilder()
-        .setColor(0x7c3aed)
-        .setTitle(`Invite stats — ${target.username}`)
-        .setThumbnail(target.displayAvatarURL({ size: 128 }))
-        .addFields(
-          { name: '👥 Current members', value: String(stats.current_members), inline: true },
-          { name: '📨 Total joins', value: String(stats.total_joins), inline: true },
-          { name: '🚪 Left server', value: String(stats.left_members), inline: true }
-        )
-        .setFooter({ text: 'Invite Tracker • Stats are recorded after the bot starts tracking.' });
-      return interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
+    if (!interaction.inGuild()) return interaction.reply({ content: 'Use this command inside a server.', ephemeral: true });
+    const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+    if (['setup', 'invite'].includes(interaction.commandName) && !isAdmin) {
+      return interaction.reply({ content: '❌ Only server administrators can use this command.', ephemeral: true });
     }
-
-    if (interaction.commandName === 'invite-leaderboard') {
-      const rows = await getLeaderboard(interaction.guildId, 10);
-      const description = rows.length
-        ? rows.map((row, index) => `**${index + 1}.** <@${row.inviter_id}> — **${row.current_members}** current · ${row.total_joins} total`).join('\n')
-        : 'No tracked invites yet. Invite tracking begins when the bot is online and can read server invites.';
-      const embed = new EmbedBuilder().setColor(0x7c3aed).setTitle('🏆 Invite Leaderboard').setDescription(description).setTimestamp();
-      return interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
-    }
-
-    if (interaction.commandName === 'invite-reset') {
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        return interaction.reply({ content: 'You need **Manage Server** permission to reset invite stats.', ephemeral: true });
+    if (interaction.commandName === 'setup') {
+      const welcome = interaction.options.getChannel('welcome_channel', true);
+      const logs = interaction.options.getChannel('invite_logs_channel', true);
+      const me = interaction.guild.members.me;
+      for (const ch of [welcome, logs]) {
+        if (!ch.isTextBased() || !ch.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)) {
+          return interaction.reply({ content: `I need **View Channel** and **Send Messages** permissions in ${ch}.`, ephemeral: true });
+        }
       }
-      const target = interaction.options.getUser('user', true);
-      const deleted = await resetUserInvites(interaction.guildId, target.id);
-      return interaction.reply({ content: `Reset ${deleted} stored invite record(s) for <@${target.id}>.`, allowedMentions: { users: [] }, ephemeral: true });
+      await pool.query(`INSERT INTO guild_settings (guild_id,welcome_channel_id,invite_logs_channel_id) VALUES ($1,$2,$3)
+        ON CONFLICT (guild_id) DO UPDATE SET welcome_channel_id=EXCLUDED.welcome_channel_id, invite_logs_channel_id=EXCLUDED.invite_logs_channel_id`, [interaction.guildId, welcome.id, logs.id]);
+      return interaction.reply({ content: `✅ Setup saved!\nWelcome channel: ${welcome}\nInvite logs: ${logs}`, ephemeral: true });
     }
-  } catch (error) {
-    console.error(`[command:${interaction.commandName}]`, error);
-    const reply = { content: 'Something went wrong while processing that command. Check the bot logs and database connection.', ephemeral: true };
-    if (interaction.deferred || interaction.replied) await interaction.followUp(reply).catch(() => {});
-    else await interaction.reply(reply).catch(() => {});
+    if (interaction.commandName === 'invite') {
+      const sub = interaction.options.getSubcommand();
+      const user = interaction.options.getUser('member', true);
+      const amount = interaction.options.getInteger('amount', true);
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      const current = await getCount(interaction.guildId, user.id);
+      if (sub === 'add') await setCount(interaction.guildId, user.id, current + amount);
+      else if (sub === 'remove') {
+        if (amount > current) return interaction.reply({ content: `❌ ${user.tag} has only ${current} tracked invite(s); cannot remove ${amount}.`, ephemeral: true });
+        await setCount(interaction.guildId, user.id, current - amount);
+      }
+      const updated = await getCount(interaction.guildId, user.id);
+      const settings = await getSettings(interaction.guildId);
+      const action = sub === 'add' ? 'Added' : 'Removed';
+      const embed = new EmbedBuilder().setColor(sub === 'add' ? 0x57F287 : 0xED4245).setTitle(`Invite Count ${action}`).addFields(
+        { name: 'Member', value: `${user.tag} (${user.id})` }, { name: 'Change', value: `${sub === 'add' ? '+' : '-'}${amount}`, inline: true },
+        { name: 'New total', value: String(updated), inline: true }, { name: 'Moderator', value: `${interaction.user.tag}` }, { name: 'Reason', value: reason }
+      ).setTimestamp();
+      if (settings?.invite_logs_channel_id) await sendToChannel(interaction.guild, settings.invite_logs_channel_id, { embeds: [embed] });
+      return interaction.reply({ content: `✅ ${action} ${amount} invite(s) for ${user}. New total: **${updated}**.`, ephemeral: true });
+    }
+    if (interaction.commandName === 'invites') {
+      const user = interaction.options.getUser('member') || interaction.user;
+      const count = await getCount(interaction.guildId, user.id);
+      return interaction.reply({ content: `🎟️ **${user.tag}** has **${count}** tracked invite(s).`, ephemeral: true });
+    }
+    if (interaction.commandName === 'invite-leaderboard') {
+      const r = await pool.query('SELECT user_id,count FROM invite_counts WHERE guild_id=$1 AND count>0 ORDER BY count DESC LIMIT 10', [interaction.guildId]);
+      const lines = r.rows.map((row, i) => `**${i + 1}.** <@${row.user_id}> — **${row.count}** invite(s)`);
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('🏆 Invite Leaderboard').setDescription(lines.join('\n') || 'No tracked invites yet.').setTimestamp()], ephemeral: false });
+    }
+  } catch (e) {
+    console.error('Command error:', e);
+    const message = { content: 'Something went wrong. Check Railway logs and ensure database/channel permissions are configured.', ephemeral: true };
+    if (interaction.replied || interaction.deferred) await interaction.followUp(message).catch(() => {});
+    else await interaction.reply(message).catch(() => {});
   }
 });
 
-process.on('SIGTERM', async () => {
-  console.log('[shutdown] Closing database pool.');
-  await pool.end().catch(() => {});
-  client.destroy();
-  process.exit(0);
-});
-
-client.login(token).catch(error => {
-  console.error('[login] Discord login failed. Check DISCORD_TOKEN.', error);
-  process.exit(1);
-});
+client.on('error', e => console.error('Discord client error:', e));
+process.on('unhandledRejection', e => console.error('Unhandled rejection:', e));
+(async () => {
+  await initDb();
+  await client.login(DISCORD_TOKEN).catch(err => {
+    console.error('[login] Discord login failed. Check DISCORD_TOKEN and enable required intents in Developer Portal > Bot. Error:', err.message);
+    process.exit(1);
+  });
+})();

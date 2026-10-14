@@ -1,79 +1,30 @@
-# Joraba Invite Tracker
+# Joraba Invite Tracker Bot
 
-A Discord invite-tracking bot built with Discord.js v14 and PostgreSQL. The repository is designed for GitHub + Railway.
+Discord.js v14 + PostgreSQL, ready for Railway. Includes `/setup`, `/invite add`, `/invite remove`, `/invites`, and `/invite-leaderboard`.
 
-## Features
+## 1. Discord Developer Portal
+1. Open https://discord.com/developers/applications and select your bot application.
+2. Under **Bot**, enable **Server Members Intent**. This is required to track member joins.
+3. Invite the bot to your server with the `bot` and `applications.commands` scopes. Grant **View Channels**, **Send Messages**, and **Manage Server** (Manage Guild) so invite codes can be fetched. Do not share your bot token.
 
-- `/invites` — show your tracked current members, total joins, and members who later left.
-- `/invites user:@member` — view another member's stats.
-- `/invite-leaderboard` — top 10 inviters by current tracked members.
-- `/invite-reset user:@member` — delete that member's tracked invite records (Manage Server permission required).
-- PostgreSQL storage survives redeploys/restarts.
-- Tracks regular invite codes when the bot can compare invite use counts.
-- Attempts to record vanity URL joins as `vanity` source, but cannot attribute them to a person.
+## 2. Railway
+1. Push these files to your GitHub repository.
+2. In Railway, add a PostgreSQL database and make its `DATABASE_URL` available to the bot service.
+3. Add service variables: `DISCORD_TOKEN`, `CLIENT_ID`, `DATABASE_URL`, and optionally `GUILD_ID` and `PGSSL`.
+4. `CLIENT_ID` is the Application ID in Developer Portal. `GUILD_ID` is your Discord server ID; using it registers commands quickly to that server.
+5. Start command: `npm start`. The `prestart` script registers slash commands before starting the bot.
 
-## 1. Create the Discord bot
+If your PostgreSQL service provides SSL, leave `PGSSL=true` (default). If your database explicitly requires no SSL, set `PGSSL=false`.
 
-1. Open the Discord Developer Portal and create an application.
-2. Open **Bot** and create/reset the bot token. Keep it private.
-3. In **Bot → Privileged Gateway Intents**, enable **Server Members Intent**.
-4. Invite the bot to your server with `bot` and `applications.commands` scopes. Give it **View Channels**, **Send Messages**, **Embed Links**, and **Manage Server** permission so it can fetch invite usage. Only grant permissions it actually needs.
-5. Copy the Application ID from **General Information**.
+## 3. Commands
+- `/setup welcome_channel:#welcome invite_logs_channel:#invite-logs` — administrator only; saves channel IDs in PostgreSQL.
+- `/invite add member:@user amount:3 reason:...` — administrator only.
+- `/invite remove member:@user amount:1 reason:...` — administrator only; cannot make a count negative.
+- `/invites [member]` — view tracked count.
+- `/invite-leaderboard` — show top 10 tracked inviters.
 
-## 2. Upload to GitHub
-
-1. Create a new GitHub repository.
-2. Upload the files in this folder (do not upload a real `.env` file or bot token).
-3. Keep `.env.example` as the safe template.
-
-## 3. Deploy on Railway
-
-1. In Railway, create a project and add a **PostgreSQL** database service.
-2. Add a new service from your GitHub repository.
-3. In the bot service's **Variables**, add:
-   - `DISCORD_TOKEN` — your bot token
-   - `CLIENT_ID` — your Discord Application ID
-   - `DATABASE_URL` — use Railway's variable reference: `${{Postgres.DATABASE_URL}}` (replace `Postgres` with the exact name of your database service if different)
-   - `PGSSL` — `false` for the normal private Railway connection
-   - Optional `GUILD_ID` — your test server ID to register commands quickly
-   - Optional `BOT_NAME` — e.g. `Joraba Invite Tracker`
-4. Railway should detect Node.js and run `npm start` from `package.json`. The `prestart` script automatically registers the slash commands before the bot starts.
-5. Ensure the database and bot service are in the same Railway project/environment so the private database reference works.
-
-## 4. Slash command registration
-
-The `prestart` script automatically runs `npm run deploy-commands` before `npm start`, so Railway registers the slash commands during startup. If you want to register them manually, run `npm run deploy-commands` after setting `DISCORD_TOKEN`, `CLIENT_ID`, and optionally `GUILD_ID`.
-
-If `GUILD_ID` is set, commands register to that server quickly. If it is blank, commands register globally and may take longer to appear.
-
-## 5. Discord server permissions / limitations
-
-- The bot must be online to observe joins and compare invite-use counts. It cannot reconstruct reliable historical invite attribution for joins that happened before tracking began.
-- Enable **Server Members Intent** in the Developer Portal and in the code (already enabled here).
-- Discord invite fetching can fail if the bot lacks **Manage Server** permission. If this permission is not granted, joins may be recorded as `unknown` rather than attributed to an inviter.
-- If multiple people join at almost exactly the same time, Discord's invite-use counters may make attribution ambiguous. Check logs if counts look unexpected.
-- Vanity URL joins cannot be assigned to a specific inviter; they are recorded without an inviter ID.
-- This bot records invite attribution and member join/leave status only. It does not scrape private messages or collect message content.
-
-## Environment variables
-
-| Variable | Required | Purpose |
-|---|---:|---|
-| `DISCORD_TOKEN` | Yes | Bot token (secret) |
-| `CLIENT_ID` | Yes | Discord application ID |
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `GUILD_ID` | No | Test server for fast command registration |
-| `PGSSL` | No | Set `true` only if your DB endpoint requires TLS |
-| `BOT_NAME` | No | Friendly name in logs |
-
-## Local development
-
-```bash
-npm install
-cp .env.example .env
-# Fill in .env with your own credentials
-npm run deploy-commands
-npm start
-```
-
-Never commit `.env`, Discord tokens, or database credentials to GitHub. If a token is exposed, reset it in the Discord Developer Portal immediately.
+## Notes
+- The bot must have permission to view/send messages in both configured channels.
+- Invite attribution can be unavailable for vanity URLs, expired/deleted invites, or if Discord does not return invite usage data.
+- The bot uses the `GuildMembers` and `GuildInvites` gateway intents. `GuildMembers` must be enabled in the Developer Portal.
+- If command registration returns `Missing Access`, verify `CLIENT_ID`, `GUILD_ID`, and that this exact application/bot is invited to that server with `applications.commands` scope.

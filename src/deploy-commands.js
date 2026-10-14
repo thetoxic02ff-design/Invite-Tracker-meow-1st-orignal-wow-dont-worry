@@ -1,35 +1,27 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName('invites')
-    .setDescription('Show how many members you have invited.')
-    .addUserOption(option => option.setName('user').setDescription('Check another member').setRequired(false)),
-  new SlashCommandBuilder()
-    .setName('invite-leaderboard')
-    .setDescription('Show the top inviters in this server.'),
-  new SlashCommandBuilder()
-    .setName('invite-reset')
-    .setDescription('Reset a member’s stored invite stats (server managers only).')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addUserOption(option => option.setName('user').setDescription('Member whose stats will be reset').setRequired(true))
-].map(command => command.toJSON());
+const { REST, Routes } = require('discord.js');
+const commands = require('./commands');
 
 async function main() {
   const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
   if (!DISCORD_TOKEN || !CLIENT_ID) {
-    throw new Error('DISCORD_TOKEN and CLIENT_ID must be set before deploying slash commands.');
+    console.error('Missing DISCORD_TOKEN or CLIENT_ID environment variable; slash commands were not registered.');
+    process.exitCode = 1;
+    return;
   }
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  const route = GUILD_ID
-    ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID)
-    : Routes.applicationCommands(CLIENT_ID);
-  await rest.put(route, { body: commands });
-  console.log(`Registered ${commands.length} slash commands ${GUILD_ID ? `to guild ${GUILD_ID}` : 'globally'}.`);
+  try {
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+      console.log(`Registered ${commands.length} slash commands to guild ${GUILD_ID}.`);
+    } else {
+      await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+      console.log(`Registered ${commands.length} global slash commands. Global commands can take time to appear.`);
+    }
+  } catch (err) {
+    console.error('Could not register slash commands:', err?.rawError?.message || err.message);
+    console.error('Check CLIENT_ID, DISCORD_TOKEN, GUILD_ID, and confirm the bot is invited to that server with applications.commands scope.');
+    process.exitCode = 1;
+  }
 }
-
-main().catch(error => {
-  console.error('Could not register slash commands:', error);
-  process.exitCode = 1;
-});
+main();
